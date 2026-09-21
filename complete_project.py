@@ -744,9 +744,237 @@ fig.tight_layout()
 savefig_to(fig, GALLERY_DIR, "15_arc_hub_to_zone_flow.png")
 
 # =============================================================================
+# STEP 11 - ML DIAGNOSTIC PLOT GALLERY (9 plots) -> ML_DIR
+# KS Plot, SHAP Plot, QQ Plot, Cumulative Explained Variance, Gini vs
+# Entropy, Bias-Variance Tradeoff, ROC Curve, Precision-Recall Curve,
+# Elbow Curve. Uses orders_df / routes_df already in memory - no file
+# reads needed.
+# =============================================================================
+ML_DIR = os.environ.get("ML_DIR", os.path.join(OUT_DIR, "ml_diagnostic_plots"))
+os.makedirs(ML_DIR, exist_ok=True)
+print(f"\n[OK] Generating 9 ML diagnostic plots into: {ML_DIR}")
+
+from scipy import stats as scipy_stats
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (precision_recall_curve, average_precision_score,
+                              roc_curve, roc_auc_score)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+
+# ---- Train the classifier used by KS / SHAP / ROC / PR plots ----
+feat_df = orders_df.copy()
+feat_df["target"] = (feat_df["Delivery_Status"] == "On Time").astype(int)
+priority_map = {"High": 0, "Medium": 1, "Low": 2}
+feat_df["Priority_Rank"] = feat_df["Priority"].map(priority_map)
+X_ml = pd.get_dummies(
+    feat_df[["Distance_Km", "Package_Weight_Kg", "Service_Time_Min", "Priority_Rank",
+             "Required_Vehicle_Type", "Origin_Hub"]],
+    columns=["Required_Vehicle_Type", "Origin_Hub"], drop_first=True
+)
+y_ml = feat_df["target"]
+X_tr, X_te, y_tr, y_te = train_test_split(X_ml, y_ml, test_size=0.3, random_state=42, stratify=y_ml)
+ml_clf = RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42)
+ml_clf.fit(X_tr, y_tr)
+y_proba = ml_clf.predict_proba(X_te)[:, 1]
+print(f"  Classifier test accuracy: {ml_clf.score(X_te, y_te):.3f}")
+
+# ---- 1. KS Plot ----
+pos = np.sort(y_proba[y_te.values == 1])
+neg = np.sort(y_proba[y_te.values == 0])
+grid = np.linspace(0, 1, 200)
+cdf_pos = np.searchsorted(pos, grid, side="right") / len(pos)
+cdf_neg = np.searchsorted(neg, grid, side="right") / len(neg)
+ks_idx = np.argmax(np.abs(cdf_pos - cdf_neg))
+ks_stat, ks_at = np.abs(cdf_pos - cdf_neg)[ks_idx], grid[ks_idx]
+
+fig, ax = plt.subplots(figsize=(8, 5.5))
+ax.plot(grid, cdf_pos, color=OPT_COLOR, label="On-Time (positive class)", linewidth=2)
+ax.plot(grid, cdf_neg, color=RED_COLOR, label="Late (negative class)", linewidth=2)
+ax.annotate("", xy=(ks_at, cdf_pos[ks_idx]), xytext=(ks_at, cdf_neg[ks_idx]),
+            arrowprops=dict(arrowstyle="<->", color="black"))
+ax.text(ks_at + 0.02, 0.5, f"KS = {ks_stat:.3f}", fontsize=11, fontweight="bold")
+ax.set_xlabel("Predicted Probability of On-Time Delivery")
+ax.set_ylabel("Cumulative Probability")
+ax.set_title("KS Plot \u2013 On-Time Classifier Separation", fontweight="bold")
+ax.legend(loc="lower right")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "01_ks_plot.png")
+
+# ---- 2. SHAP Plot ----
+try:
+    import shap
+    explainer = shap.TreeExplainer(ml_clf)
+    sample = X_te.sample(min(300, len(X_te)), random_state=42)
+    shap_values = explainer.shap_values(sample)
+    if isinstance(shap_values, list):
+        sv = shap_values[1]
+    elif shap_values.ndim == 3:
+        sv = shap_values[:, :, 1]
+    else:
+        sv = shap_values
+    plt.figure(figsize=(9, 6))
+    shap.summary_plot(sv, sample, show=False)
+    fig = plt.gcf()
+    fig.suptitle("SHAP Plot \u2013 Feature Impact on On-Time Prediction", fontweight="bold", y=1.02)
+    fig.tight_layout()
+    savefig_to(fig, ML_DIR, "02_shap_plot.png")
+except ImportError:
+    print("  [skip] shap not installed - run `!pip install shap` in a cell above and re-run to include this plot.")
+
+# ---- 3. QQ Plot ----
+fig, ax = plt.subplots(figsize=(7.5, 6.5))
+scipy_stats.probplot(orders_df["Delay_Min"], dist="norm", plot=ax)
+ax.get_lines()[0].set_markerfacecolor(ACCENT_COLOR)
+ax.get_lines()[0].set_markeredgecolor(ACCENT_COLOR)
+ax.get_lines()[0].set_alpha(0.5)
+ax.get_lines()[1].set_color(RED_COLOR)
+ax.set_title("QQ Plot \u2013 Baseline Delay vs Normal Distribution", fontweight="bold")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "03_qq_plot.png")
+
+# ---- 4. Cumulative Explained Variance ----
+num_cols = ["Distance_Km", "Package_Weight_Kg", "Service_Time_Min",
+            "Existing_Planned_Distance_Km", "Existing_Estimated_Time_Min",
+            "Delay_Min", "Optimized_Delay_Min"]
+X_num = StandardScaler().fit_transform(orders_df[num_cols].fillna(0))
+pca = PCA()
+pca.fit(X_num)
+var_ratio = pca.explained_variance_ratio_
+cum_var = np.cumsum(var_ratio)
+
+fig, ax = plt.subplots(figsize=(8.5, 5.5))
+xc = np.arange(1, len(var_ratio) + 1)
+ax.bar(xc, var_ratio * 100, color="#F4A261", alpha=0.8, label="Individual Component Variance")
+ax.plot(xc, cum_var * 100, color=ACCENT_COLOR, marker="o", linewidth=2, label="Cumulative Variance")
+for xi, yi in zip(xc, cum_var * 100):
+    ax.text(xi, yi + 2, f"{yi:.0f}%", ha="center", fontsize=8)
+ax.set_xlabel("Principal Component Number")
+ax.set_ylabel("Explained Variance (%)")
+ax.set_xticks(xc)
+ax.set_ylim(0, 110)
+ax.set_title("Cumulative Explained Variance \u2013 Order Numeric Features (PCA)", fontweight="bold")
+ax.legend(loc="center right")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "04_cumulative_explained_variance.png")
+
+# ---- 5. Gini-Impurity vs Entropy (pure math, not data-specific) ----
+p = np.linspace(0.001, 0.999, 300)
+entropy = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
+gini = 2 * p * (1 - p)
+misclass = 1 - np.maximum(p, 1 - p)
+
+fig, ax = plt.subplots(figsize=(8.5, 5.5))
+ax.plot(p, entropy, color="black", linewidth=2, label="Entropy")
+ax.plot(p, entropy / 2, color="grey", linewidth=1.5, label="Entropy (scaled)")
+ax.plot(p, gini, color=RED_COLOR, linewidth=2, linestyle="--", label="Gini Impurity")
+ax.plot(p, misclass, color=OPT_COLOR, linewidth=2, linestyle="-.", label="Misclassification Error")
+ax.set_xlabel("p (i = 1)")
+ax.set_ylabel("Impurity Index")
+ax.set_title("Gini-Impurity vs Entropy \u2013 Split Criteria Used in Tree-Based Allocation Logic",
+             fontweight="bold", fontsize=11.5)
+ax.legend()
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "05_gini_vs_entropy.png")
+
+# ---- 6. Bias-Variance Tradeoff ----
+bv_X = orders_df[["Distance_Km", "Package_Weight_Kg", "Service_Time_Min"]]
+bv_y = orders_df["Delay_Min"]
+Xtr, Xte, ytr, yte = train_test_split(bv_X, bv_y, test_size=0.3, random_state=42)
+depths = range(1, 16)
+train_err, test_err = [], []
+for d in depths:
+    m = DecisionTreeRegressor(max_depth=d, random_state=42)
+    m.fit(Xtr, ytr)
+    train_err.append(np.mean((m.predict(Xtr) - ytr) ** 2))
+    test_err.append(np.mean((m.predict(Xte) - yte) ** 2))
+train_err, test_err = np.array(train_err), np.array(test_err)
+variance_proxy = np.maximum(0, test_err - train_err)
+optimum_depth = list(depths)[np.argmin(test_err)]
+
+fig, ax = plt.subplots(figsize=(8.5, 5.5))
+ax.plot(depths, test_err, color="black", linewidth=2, label="Total Error (test MSE)")
+ax.plot(depths, train_err, color=RED_COLOR, linewidth=2, label="Bias\u00b2 proxy (train MSE)")
+ax.plot(depths, variance_proxy, color=OPT_COLOR, linewidth=2, label="Variance proxy (test - train MSE)")
+ax.axvline(optimum_depth, color="grey", linestyle=":", linewidth=1.5)
+ymin, ymax = ax.get_ylim()
+ax.text(optimum_depth + 0.3, ymin + (ymax - ymin) * 0.08, "Optimum Model\nComplexity",
+        fontsize=9, color="dimgrey")
+ax.set_xlabel("Model Complexity (Decision Tree max_depth)")
+ax.set_ylabel("Error (MSE, minutes\u00b2)")
+ax.set_title("Bias-Variance Tradeoff \u2013 Delay Prediction by Tree Depth", fontweight="bold")
+ax.legend(loc="upper center")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "06_bias_variance_tradeoff.png")
+
+# ---- 7. ROC Curve ----
+fpr, tpr, _ = roc_curve(y_te, y_proba)
+auc = roc_auc_score(y_te, y_proba)
+fig, ax = plt.subplots(figsize=(7, 6.5))
+ax.plot(fpr, tpr, color=ACCENT_COLOR, linewidth=2, label=f"On-Time Classifier (AUC = {auc:.3f})")
+ax.plot([0, 1], [0, 1], color=RED_COLOR, linestyle="--", linewidth=1.5, label="Random Classifier")
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.set_title("ROC Curve \u2013 On-Time Delivery Classifier", fontweight="bold")
+ax.legend(loc="lower right")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "07_roc_curve.png")
+
+# ---- 8. Precision-Recall Curve ----
+precision, recall, _ = precision_recall_curve(y_te, y_proba)
+ap = average_precision_score(y_te, y_proba)
+baseline_rate = y_te.mean()
+fig, ax = plt.subplots(figsize=(7.5, 6.5))
+ax.plot(recall, precision, color="#F4A261", linewidth=2, marker=".", markersize=3,
+        label=f"On-Time Classifier (AP = {ap:.3f})")
+ax.axhline(baseline_rate, color=ACCENT_COLOR, linestyle="--", linewidth=1.5,
+           label=f"No Skill (base rate = {baseline_rate:.2f})")
+ax.set_xlabel("Recall")
+ax.set_ylabel("Precision")
+ax.set_title("Precision-Recall Curve \u2013 On-Time Delivery Classifier", fontweight="bold")
+ax.legend(loc="lower left")
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "08_precision_recall_curve.png")
+
+# ---- 9. Elbow Curve ----
+cluster_X = StandardScaler().fit_transform(
+    orders_df[["Distance_Km", "Package_Weight_Kg", "Service_Time_Min"]])
+ks_range = range(1, 11)
+wcss = []
+for k in ks_range:
+    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+    km.fit(cluster_X)
+    wcss.append(km.inertia_)
+wcss = np.array(wcss)
+p1 = np.array([1, wcss[0]])
+p2 = np.array([len(ks_range), wcss[-1]])
+line_vec = (p2 - p1) / np.linalg.norm(p2 - p1)
+distances = []
+for i, k in enumerate(ks_range):
+    pnt = np.array([k, wcss[i]])
+    proj = p1 + np.dot(pnt - p1, line_vec) * line_vec
+    distances.append(np.linalg.norm(pnt - proj))
+elbow_k = list(ks_range)[int(np.argmax(distances))]
+
+fig, ax = plt.subplots(figsize=(8, 5.5))
+ax.plot(list(ks_range), wcss, color=ACCENT_COLOR, marker="o", linewidth=2)
+ax.annotate("Elbow Point", xy=(elbow_k, wcss[elbow_k - 1]),
+            xytext=(elbow_k + 1.3, wcss[elbow_k - 1] + wcss[0] * 0.12),
+            arrowprops=dict(arrowstyle="->", color=RED_COLOR), fontsize=10, fontweight="bold", color=RED_COLOR)
+ax.set_xlabel("K - Value (number of order clusters)")
+ax.set_ylabel("WCSS")
+ax.set_title("Elbow Curve \u2013 Optimal Order Clusters by Distance/Weight/Service Time",
+             fontweight="bold", fontsize=11.5)
+fig.tight_layout()
+savefig_to(fig, ML_DIR, "09_elbow_curve.png")
+
+# =============================================================================
 # DONE
 # =============================================================================
 print(f"\nDONE. Result files: {OUT_DIR}")
 print(f"DONE. 10 core plots: {PLOTS_DIR}")
 print(f"DONE. 15-chart gallery: {GALLERY_DIR}")
+print(f"DONE. 9 ML diagnostic plots: {ML_DIR}")
 print("You can now download all of these from the Colab folder panel.")
